@@ -177,6 +177,25 @@ WHERE CATALOG_NAME = %(CATALOG_NAME)s
   AND DOCUMENTATION_VERSION = %(DOCUMENTATION_VERSION)s
 """
 
+def delete_documentation_for_current_version(
+    conn,
+    row: Dict[str, Any],
+) -> int:
+    params = {
+        "CATALOG_NAME": row["CATALOG_NAME"],
+        "SCHEMA_NAME": row["SCHEMA_NAME"],
+        "PROCEDURE_NAME": row["PROCEDURE_NAME"],
+        "ARGUMENTS": row["ARGUMENTS"],
+        "OBJECT_TYPE": row["OBJECT_TYPE"],
+        "CHANGE_HASH": row["CHANGE_HASH"],
+        "DOCUMENTATION_VERSION": DOCUMENTATION_VERSION,
+    }
+    with conn.cursor() as cur:
+        cur.execute(DELETE_DOC_SQL, params)
+        deleted = cur.rowcount
+    conn.commit()
+    return deleted
+
 
 @dataclass
 class JobResult:

@@ -1,5 +1,7 @@
 UBUNTU or VSCode Terminal > WSL
 
-cd "folder location"
+#BASH
+cd "/mnt/c/Users/MichaelTalbert/OneDrive - VoltaGrid/Desktop/sproc-docs"
+source .venv/bin/activate
 ./scripts/bootstrap_and_launch.sh
 
