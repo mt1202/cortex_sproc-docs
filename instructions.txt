@@ -1,0 +1,5 @@
+UBUNTU or VSCode Terminal > WSL
+
+cd "folder location"
+./scripts/bootstrap_and_launch.sh
+
