@@ -17,9 +17,7 @@ DOCUMENTATION_VERSION = "v1.0"
 TARGET_TABLE = "PROD_TELEMETRY_DB.BACKUP.PROCEDURE_DOCUMENTATION"
 SOURCE_TABLE = "PROD_TELEMETRY_DB.BACKUP.DDL_HISTORY_PROCEDURES"
 
-DEFAULT_BACKUP_CALL = "CALL PROD_TELEMETRY_DB.BACKUP.LOAD_DDL_HISTORY_PROCEDURES()"
-
-SOURCE_QUERY = f"""
+CATALOG_QUERY = f"""
 WITH latest_source AS (
     SELECT
         h.CATALOG_NAME,
@@ -39,6 +37,32 @@ WITH latest_source AS (
         ) AS VERSION_RANK
     FROM {SOURCE_TABLE} h
     WHERE h.IS_CURRENT = TRUE
+),
+latest_docs AS (
+    SELECT
+        d.CATALOG_NAME,
+        d.SCHEMA_NAME,
+        d.PROCEDURE_NAME,
+        d.ARGUMENTS,
+        d.OBJECT_TYPE,
+        d.CHANGE_HASH,
+        d.DOCUMENTATION_VERSION,
+        d.DOCUMENTATION_STATUS,
+        d.DOCUMENTED_AT,
+        d.LANGUAGE,
+        d.RETURNS_TYPE,
+        d.IDEMPOTENCY_CLASSIFICATION,
+        d.USES_DYNAMIC_SQL,
+        d.RISK_COUNT,
+        d.SUMMARY,
+        d.MARKDOWN_DOC,
+        d.DOCUMENTATION_JSON,
+        ROW_NUMBER() OVER (
+            PARTITION BY d.CATALOG_NAME, d.SCHEMA_NAME, d.PROCEDURE_NAME, d.ARGUMENTS, d.OBJECT_TYPE, d.CHANGE_HASH, d.DOCUMENTATION_VERSION
+            ORDER BY d.DOCUMENTED_AT DESC
+        ) AS DOC_RANK
+    FROM {TARGET_TABLE} d
+    WHERE d.DOCUMENTATION_VERSION = %s
 )
 SELECT
     s.CATALOG_NAME,
@@ -47,24 +71,34 @@ SELECT
     s.ARGUMENTS,
     s.OBJECT_TYPE,
     s.CREATED_ON,
-    s.EFFECTIVE_FROM     AS SOURCE_EFFECTIVE_FROM,
-    s.EFFECTIVE_TO       AS SOURCE_EFFECTIVE_TO,
-    s.IS_CURRENT         AS SOURCE_IS_CURRENT,
+    s.EFFECTIVE_FROM AS SOURCE_EFFECTIVE_FROM,
+    s.EFFECTIVE_TO AS SOURCE_EFFECTIVE_TO,
+    s.IS_CURRENT AS SOURCE_IS_CURRENT,
     s.PROCEDURE_DDL,
     s.CHANGE_HASH,
     s.VERSION_RANK,
     s.CATALOG_NAME || '.' || s.SCHEMA_NAME || '.' || s.PROCEDURE_NAME AS PROCEDURE_FQN,
-    s.CATALOG_NAME || '|' || s.SCHEMA_NAME || '|' || s.PROCEDURE_NAME || '|' || s.ARGUMENTS || '|' || s.OBJECT_TYPE AS PROCEDURE_ID
+    s.CATALOG_NAME || '|' || s.SCHEMA_NAME || '|' || s.PROCEDURE_NAME || '|' || s.ARGUMENTS || '|' || s.OBJECT_TYPE AS PROCEDURE_ID,
+    d.DOCUMENTATION_STATUS,
+    d.DOCUMENTED_AT,
+    d.LANGUAGE,
+    d.RETURNS_TYPE,
+    d.IDEMPOTENCY_CLASSIFICATION,
+    d.USES_DYNAMIC_SQL,
+    d.RISK_COUNT,
+    d.SUMMARY,
+    d.MARKDOWN_DOC,
+    d.DOCUMENTATION_JSON,
+    CASE WHEN d.CHANGE_HASH IS NOT NULL THEN TRUE ELSE FALSE END AS HAS_DOCUMENTATION
 FROM latest_source s
-LEFT JOIN {TARGET_TABLE} d
-    ON  s.CATALOG_NAME          = d.CATALOG_NAME
-    AND s.SCHEMA_NAME           = d.SCHEMA_NAME
-    AND s.PROCEDURE_NAME        = d.PROCEDURE_NAME
-    AND s.ARGUMENTS             = d.ARGUMENTS
-    AND s.OBJECT_TYPE           = d.OBJECT_TYPE
-    AND s.CHANGE_HASH           = d.CHANGE_HASH
-    AND d.DOCUMENTATION_VERSION = %s
-WHERE d.CHANGE_HASH IS NULL
+LEFT JOIN latest_docs d
+    ON  s.CATALOG_NAME = d.CATALOG_NAME
+    AND s.SCHEMA_NAME = d.SCHEMA_NAME
+    AND s.PROCEDURE_NAME = d.PROCEDURE_NAME
+    AND s.ARGUMENTS = d.ARGUMENTS
+    AND s.OBJECT_TYPE = d.OBJECT_TYPE
+    AND s.CHANGE_HASH = d.CHANGE_HASH
+    AND d.DOC_RANK = 1
 ORDER BY s.CATALOG_NAME, s.SCHEMA_NAME, s.PROCEDURE_NAME, s.ARGUMENTS
 """
 
@@ -132,6 +166,17 @@ SELECT
     PARSE_JSON(%(DOCUMENTATION_JSON)s), %(MARKDOWN_DOC)s
 """
 
+DELETE_DOC_SQL = f"""
+DELETE FROM {TARGET_TABLE}
+WHERE CATALOG_NAME = %(CATALOG_NAME)s
+  AND SCHEMA_NAME = %(SCHEMA_NAME)s
+  AND PROCEDURE_NAME = %(PROCEDURE_NAME)s
+  AND ARGUMENTS = %(ARGUMENTS)s
+  AND OBJECT_TYPE = %(OBJECT_TYPE)s
+  AND CHANGE_HASH = %(CHANGE_HASH)s
+  AND DOCUMENTATION_VERSION = %(DOCUMENTATION_VERSION)s
+"""
+
 
 @dataclass
 class JobResult:
@@ -157,18 +202,10 @@ def execute_sql(conn, sql: str, params=None) -> None:
 
 
 def extract_argument_tail(arguments: Optional[str]) -> str:
-    """
-    Converts:
-      BACKFILL_CONTROLCUBE_AGG_ASSET_MINUTE(DEFAULT NUMBER, DEFAULT NUMBER) RETURN VARCHAR
-    to:
-      (DEFAULT NUMBER, DEFAULT NUMBER) RETURN VARCHAR
-    """
     if not arguments:
         return "()"
 
     text = str(arguments).strip()
-
-    # Remove leading proc/function name if present.
     text = re.sub(r"^[^(]+", "", text).strip()
 
     if not text.startswith("("):
@@ -183,7 +220,7 @@ def build_display_signature(row: Dict[str, Any]) -> str:
     return f"{procedure_fqn}{arg_tail}"
 
 
-def enrich_source_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def enrich_catalog_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     enriched: List[Dict[str, Any]] = []
     for row in rows:
         new_row = dict(row)
@@ -192,24 +229,20 @@ def enrich_source_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return enriched
 
 
-def select_source_rows(
+def list_procedure_catalog(conn) -> List[Dict[str, Any]]:
+    rows = fetch_rows(conn, CATALOG_QUERY, (DOCUMENTATION_VERSION,))
+    return enrich_catalog_rows(rows)
+
+
+def get_catalog_row_by_id(
     conn,
-    max_rows: Optional[int],
-    selected_procedure_id: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    rows = fetch_rows(conn, SOURCE_QUERY, (DOCUMENTATION_VERSION,))
-    rows = enrich_source_rows(rows)
-
-    if selected_procedure_id:
-        rows = [
-            row for row in rows
-            if row.get("PROCEDURE_ID") == selected_procedure_id
-        ]
-
-    if max_rows is not None:
-        rows = rows[:max_rows]
-
-    return rows
+    procedure_id: str,
+) -> Optional[Dict[str, Any]]:
+    rows = list_procedure_catalog(conn)
+    for row in rows:
+        if row.get("PROCEDURE_ID") == procedure_id:
+            return row
+    return None
 
 
 def build_insert_payload(
@@ -361,6 +394,26 @@ def insert_failure(conn, payload: Dict[str, Any]) -> None:
         cur.execute(FAILURE_INSERT_SQL, payload)
 
 
+def delete_documentation_for_current_version(
+    conn,
+    row: Dict[str, Any],
+) -> int:
+    params = {
+        "CATALOG_NAME": row["CATALOG_NAME"],
+        "SCHEMA_NAME": row["SCHEMA_NAME"],
+        "PROCEDURE_NAME": row["PROCEDURE_NAME"],
+        "ARGUMENTS": row["ARGUMENTS"],
+        "OBJECT_TYPE": row["OBJECT_TYPE"],
+        "CHANGE_HASH": row["CHANGE_HASH"],
+        "DOCUMENTATION_VERSION": DOCUMENTATION_VERSION,
+    }
+    with conn.cursor() as cur:
+        cur.execute(DELETE_DOC_SQL, params)
+        deleted = cur.rowcount
+    conn.commit()
+    return deleted
+
+
 def run_documentation_job(
     conn_params: Dict[str, Any],
     selected_connection_name: str,
@@ -368,12 +421,9 @@ def run_documentation_job(
     model_name: str,
     skill_name: str,
     documentation_model_label: str,
-    max_rows: int,
-    call_backup_proc: bool = False,
-    backup_call_sql: str = DEFAULT_BACKUP_CALL,
-    keep_prompt_files: bool = False,
+    selected_procedure_id: str,
+    dry_run: bool = False,
     bypass: bool = True,
-    selected_procedure_id: Optional[str] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> JobResult:
     def log(msg: str) -> None:
@@ -386,60 +436,60 @@ def run_documentation_job(
     failures: List[Dict[str, str]] = []
 
     try:
-        if call_backup_proc:
-            log(f"Calling backup procedure: {backup_call_sql}")
-            execute_sql(conn, backup_call_sql)
+        row = get_catalog_row_by_id(conn, selected_procedure_id)
+        if not row:
+            raise RuntimeError("Selected procedure was not found in the current catalog.")
+
+        total_selected = 1
+        signature = row["PROCEDURE_SIGNATURE"]
+        log(f"Selected {total_selected} procedure.")
+        log(f"Processing {signature}")
+
+        if dry_run:
+            log("Dry run enabled. No documentation row will be written.")
+            return JobResult(
+                total_selected=1,
+                documented=0,
+                failed=0,
+                failures=[],
+            )
+
+        try:
+            prompt_text = build_prompt(row, skill_name)
+            cortex_output = call_cortex_cli(
+                prompt_text=prompt_text,
+                connection_name=selected_connection_name,
+                workdir=workdir,
+                model_name=model_name,
+                keep_prompt_files=False,
+                bypass=bypass,
+            )
+            doc_json, markdown_doc = parse_cortex_response(cortex_output)
+            payload = build_insert_payload(
+                row=row,
+                doc_json=doc_json,
+                markdown_doc=markdown_doc,
+                documentation_model_label=documentation_model_label,
+            )
+            insert_documentation(conn, payload)
             conn.commit()
-
-        rows = select_source_rows(
-            conn,
-            max_rows=max_rows,
-            selected_procedure_id=selected_procedure_id,
-        )
-
-        total_selected = len(rows)
-        log(f"Selected {total_selected} undocumented procedure(s).")
-
-        for idx, row in enumerate(rows, start=1):
-            signature = row["PROCEDURE_SIGNATURE"]
-            log(f"[{idx}/{total_selected}] Processing {signature}")
-
-            try:
-                prompt_text = build_prompt(row, skill_name)
-                cortex_output = call_cortex_cli(
-                    prompt_text=prompt_text,
-                    connection_name=selected_connection_name,
-                    workdir=workdir,
-                    model_name=model_name,
-                    keep_prompt_files=keep_prompt_files,
-                    bypass=bypass,
-                )
-                doc_json, markdown_doc = parse_cortex_response(cortex_output)
-                payload = build_insert_payload(
-                    row=row,
-                    doc_json=doc_json,
-                    markdown_doc=markdown_doc,
-                    documentation_model_label=documentation_model_label,
-                )
-                insert_documentation(conn, payload)
-                conn.commit()
-                documented += 1
-                log(f"Success: {signature}")
-            except Exception as exc:
-                failed += 1
-                error_message = str(exc)
-                failures.append({"procedure_signature": signature, "error": error_message})
-                failure_payload = build_failure_payload(
-                    row=row,
-                    documentation_model_label=documentation_model_label,
-                    error_message=error_message,
-                )
-                insert_failure(conn, failure_payload)
-                conn.commit()
-                log(f"FAILED: {signature} -> {error_message}")
+            documented = 1
+            log(f"Success: {signature}")
+        except Exception as exc:
+            failed = 1
+            error_message = str(exc)
+            failures.append({"procedure_signature": signature, "error": error_message})
+            failure_payload = build_failure_payload(
+                row=row,
+                documentation_model_label=documentation_model_label,
+                error_message=error_message,
+            )
+            insert_failure(conn, failure_payload)
+            conn.commit()
+            log(f"FAILED: {signature} -> {error_message}")
 
         return JobResult(
-            total_selected=total_selected,
+            total_selected=1,
             documented=documented,
             failed=failed,
             failures=failures,
